@@ -1,5 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import L from 'leaflet'
+import mqtt from 'mqtt'
+
+// ---- Multiplayer ----------------------------------------------------------
+// Presence is shared over a free public MQTT broker (no account needed).
+// NOTE: public broker = genuinely public. Anyone can read this topic.
+// For a private world, swap BROKER/TOPIC for your own server.
+const BROKER = 'wss://broker.emqx.io:8084/mqtt'
+const TOPIC = 'endermaps/v1/players'
+const STALE_MS = 30000 // drop players silent for 30s
+
+// Whitelist-sanitize names: they come from strangers and go into the DOM.
+const cleanName = (s) => (s || '').replace(/[^\w \-\[\]]/g, '').slice(0, 16).trim()
 
 // ---- Overworld math -------------------------------------------------------
 const R = 6378137
@@ -78,18 +90,33 @@ const maneuverText = (step) => {
   return { icon: ARROWS[modifier] || '⬆', text: `Turn ${modifier || ''}${name}`.replace('  ', ' ') }
 }
 
-// ---- Pixel icons (original pixel art, drawn in the style of in-game map
-// markers — stepped white cursor, red X target, green flag for the start) ----
+// ---- Pixel icons (original pixel art in the style of in-game map markers) --
+const cursorSvg = (fill, shade, w = 30, h = 26) =>
+  `<svg width="${w}" height="${h}" viewBox="-1 -1 18 15" shape-rendering="crispEdges" style="image-rendering:pixelated">
+    <path d="M7 0 H9 V2 H11 V4 H13 V6 H15 V12 H10 V9 H6 V12 H1 V6 H3 V4 H5 V2 H7 Z"
+      fill="${fill}" stroke="#3a3a3a" stroke-width="1"/>
+    <path d="M7 2 H8 V4 H9 V6 H8 V9 H7 V6 H6 V4 H7 Z" fill="${shade}"/>
+  </svg>`
+
 const playerIcon = L.divIcon({
   className: 'pixel-marker',
-  html: `<svg width="30" height="26" viewBox="-1 -1 18 15" shape-rendering="crispEdges" style="image-rendering:pixelated">
-    <path d="M7 0 H9 V2 H11 V4 H13 V6 H15 V12 H10 V9 H6 V12 H1 V6 H3 V4 H5 V2 H7 Z"
-      fill="#ffffff" stroke="#3a3a3a" stroke-width="1"/>
-    <path d="M7 2 H8 V4 H9 V6 H8 V9 H7 V6 H6 V4 H7 Z" fill="#c8c8c8"/>
-  </svg>`,
+  html: cursorSvg('#ffffff', '#c8c8c8'),
   iconSize: [30, 26],
   iconAnchor: [15, 13],
 })
+
+// Other players: green cursor + floating nametag, like seeing someone in-world
+const otherIcon = (name) =>
+  L.divIcon({
+    className: 'pixel-marker',
+    html: `<div class="other-wrap">
+      <div class="nametag">${name}</div>
+      ${cursorSvg('#8fe388', '#5fb35a', 24, 21)}
+    </div>`,
+    iconSize: [120, 48],
+    iconAnchor: [60, 38],
+  })
+
 const destIcon = L.divIcon({
   className: 'pixel-marker',
   html: `<svg width="28" height="28" viewBox="0 0 18 18" shape-rendering="crispEdges" style="image-rendering:pixelated">
@@ -111,27 +138,12 @@ const destIcon = L.divIcon({
   iconSize: [28, 28],
   iconAnchor: [14, 14],
 })
-const startIcon = L.divIcon({
-  className: 'pixel-marker',
-  html: `<svg width="28" height="28" viewBox="0 0 16 16" shape-rendering="crispEdges" style="image-rendering:pixelated">
-    <rect x="6" y="1" width="1" height="14" fill="#2a2a2a"/>
-    <rect x="7" y="1" width="2" height="14" fill="#5a3d1e"/>
-    <rect x="9" y="1" width="6" height="2" fill="#2f8f3a"/>
-    <rect x="9" y="3" width="5" height="2" fill="#43b34d"/>
-    <rect x="9" y="5" width="3" height="2" fill="#2f8f3a"/>
-  </svg>`,
-  iconSize: [28, 28],
-  iconAnchor: [13, 26],
-})
 
 const MODES = {
   drive: { label: '🛒 Drive', color: '#3b82f6' },
   cycle: { label: '🚲 Cycle', color: '#6aab4a' },
   transit: { label: '🚌 Transit', color: '#a35ce8' },
 }
-
-// Routes starting within this distance of your GPS fix count as "from here"
-const SAME_SPOT_M = 50
 
 export default function App() {
   const mapEl = useRef(null)
@@ -140,16 +152,19 @@ export default function App() {
   const playerRef = useRef(null)
   const accuracyRef = useRef(null)
   const destRef = useRef(null)
-  const startMarkerRef = useRef(null)
   const routeRef = useRef(L.layerGroup())
-  const posRef = useRef(null)       // live GPS position
-  const startPosRef = useRef(null)  // custom start; null = use live position
+  const posRef = useRef(null)
   const destPosRef = useRef(null)
   const watchRef = useRef(null)
   const stepsRef = useRef([])
   const stepIdxRef = useRef(0)
   const navRef = useRef(false)
-  const pickRef = useRef('dest')    // what a map tap sets: 'start' | 'dest'
+  // multiplayer refs
+  const clientRef = useRef(null)
+  const othersRef = useRef(new Map()) // id -> { marker, ts }
+  const visibleRef = useRef(true)
+  const playerInfoRef = useRef(null) // { id, name }
+  const lastPubRef = useRef(0)
 
   const [hud, setHud] = useState({ x: 0, y: 64, z: 0, biome: 'Plains', zoom: 13 })
   const [query, setQuery] = useState('')
@@ -157,10 +172,12 @@ export default function App() {
   const [night, setNight] = useState(false)
   const [blocky, setBlocky] = useState(false)
   const [hasDest, setHasDest] = useState(false)
-  const [pick, setPick] = useState('dest')
-  const [customStart, setCustomStart] = useState(null) // label, or null = my location
-  const [route, setRoute] = useState(null)             // { mode, dist, time, legs, fromCurrent }
+  const [route, setRoute] = useState(null)
   const [nav, setNav] = useState(null)
+  const [player, setPlayer] = useState(null)
+  const [nameInput, setNameInput] = useState('')
+  const [visible, setVisible] = useState(true)
+  const [online, setOnline] = useState(1)
 
   // ---- Map setup ----------------------------------------------------------
   useEffect(() => {
@@ -196,16 +213,108 @@ export default function App() {
 
     map.on('click', (e) => {
       if (navRef.current) return
-      if (pickRef.current === 'start') setStart(e.latlng.lat, e.latlng.lng, 'Picked point')
-      else setDestination(e.latlng.lat, e.latlng.lng, 'Waypoint')
+      setDestination(e.latlng.lat, e.latlng.lng, 'Waypoint')
     })
     return () => watchRef.current && navigator.geolocation.clearWatch(watchRef.current)
   }, [])
 
-  const changePick = (target) => {
-    pickRef.current = target
-    setPick(target)
-    setStatus(target === 'start' ? 'Tap the map (or search) to set the START point' : 'Tap the map (or search) to set the destination')
+  // ---- Multiplayer: connect after joining ---------------------------------
+  const publish = (obj) => {
+    try { clientRef.current?.publish(TOPIC, JSON.stringify(obj)) } catch { /* offline */ }
+  }
+  const publishPos = (force = false) => {
+    const me = playerInfoRef.current
+    if (!me || !visibleRef.current || !posRef.current) return
+    const now = Date.now()
+    if (!force && now - lastPubRef.current < 3000) return // throttle
+    lastPubRef.current = now
+    publish({ id: me.id, n: me.name, lat: posRef.current.lat, lng: posRef.current.lng, t: now })
+  }
+  const publishGone = () => {
+    const me = playerInfoRef.current
+    if (me) publish({ id: me.id, gone: true })
+  }
+
+  useEffect(() => {
+    if (!player) return
+    playerInfoRef.current = player
+    const client = mqtt.connect(BROKER, {
+      clientId: `ender_${player.id}`,
+      keepalive: 30,
+      reconnectPeriod: 3000,
+    })
+    clientRef.current = client
+    client.on('connect', () => {
+      client.subscribe(TOPIC)
+      publishPos(true)
+    })
+    client.on('message', (_topic, payload) => {
+      let d
+      try { d = JSON.parse(payload.toString()) } catch { return }
+      if (!d?.id || d.id === player.id) return
+      const others = othersRef.current
+      if (d.gone) {
+        others.get(d.id)?.marker.remove()
+        others.delete(d.id)
+      } else if (typeof d.lat === 'number' && typeof d.lng === 'number') {
+        const name = cleanName(d.n) || 'Player'
+        const entry = others.get(d.id)
+        if (entry) {
+          entry.marker.setLatLng([d.lat, d.lng])
+          entry.ts = Date.now()
+        } else {
+          others.set(d.id, {
+            marker: L.marker([d.lat, d.lng], { icon: otherIcon(name), zIndexOffset: -100 })
+              .addTo(mapRef.current),
+            ts: Date.now(),
+          })
+        }
+      }
+      setOnline(othersRef.current.size + 1)
+    })
+
+    const heartbeat = setInterval(() => publishPos(true), 5000)
+    const reaper = setInterval(() => {
+      const now = Date.now()
+      for (const [id, e] of othersRef.current) {
+        if (now - e.ts > STALE_MS) {
+          e.marker.remove()
+          othersRef.current.delete(id)
+        }
+      }
+      setOnline(othersRef.current.size + 1)
+    }, 10000)
+    const bye = () => publishGone()
+    window.addEventListener('beforeunload', bye)
+
+    return () => {
+      clearInterval(heartbeat)
+      clearInterval(reaper)
+      window.removeEventListener('beforeunload', bye)
+      publishGone()
+      client.end(true)
+    }
+  }, [player])
+
+  const join = (e) => {
+    e.preventDefault()
+    const name = cleanName(nameInput)
+    if (!name) return
+    setPlayer({ name, id: crypto.randomUUID().slice(0, 8) })
+    locate()
+  }
+
+  const toggleVisible = () => {
+    const next = !visible
+    setVisible(next)
+    visibleRef.current = next
+    if (next) {
+      publishPos(true)
+      setStatus('You are visible to other players again')
+    } else {
+      publishGone()
+      setStatus('👻 Invisible — your position is no longer shared')
+    }
   }
 
   // ---- Graphics toggle ----------------------------------------------------
@@ -262,6 +371,8 @@ export default function App() {
         if (svg && heading != null && !Number.isNaN(heading))
           svg.style.transform = `rotate(${heading}deg)`
 
+        publishPos()
+
         if (navRef.current) {
           mapRef.current.setView([lat, lng], Math.max(mapRef.current.getZoom(), 17), { animate: true })
           updateNav({ lat, lng })
@@ -283,8 +394,6 @@ export default function App() {
   // ---- Navigation on/off --------------------------------------------------
   const startNav = () => {
     if (!stepsRef.current.length) return
-    if (!route?.fromCurrent)
-      return setStatus('Live navigation only works from where you actually are — reroute from your location first')
     navRef.current = true
     stepIdxRef.current = 0
     setStatus('')
@@ -297,30 +406,7 @@ export default function App() {
     if (clearBanner) setNav(null)
   }
 
-  // ---- Start & destination ------------------------------------------------
-  const setStart = (lat, lng, label) => {
-    startPosRef.current = { lat, lng }
-    setCustomStart(label)
-    if (startMarkerRef.current) startMarkerRef.current.remove()
-    startMarkerRef.current = L.marker([lat, lng], { icon: startIcon })
-      .addTo(mapRef.current)
-      .bindPopup(`Start: ${label}`)
-    clearRoute()
-    changePick('dest')
-    setStatus('Start set — now set a destination and pick a travel mode')
-  }
-
-  const resetStartToMe = () => {
-    startPosRef.current = null
-    setCustomStart(null)
-    if (startMarkerRef.current) {
-      startMarkerRef.current.remove()
-      startMarkerRef.current = null
-    }
-    clearRoute()
-    setStatus('Start: your live position')
-  }
-
+  // ---- Destination + search ----------------------------------------------
   const setDestination = (lat, lng, label) => {
     destPosRef.current = { lat, lng }
     setHasDest(true)
@@ -342,11 +428,8 @@ export default function App() {
       const data = await res.json()
       if (!data.length) return setStatus('Structure not found')
       const { lat, lon, display_name } = data[0]
-      const label = display_name.split(',')[0]
       mapRef.current.flyTo([+lat, +lon], 15, { duration: 1.2 })
-      if (pickRef.current === 'start') setStart(+lat, +lon, label)
-      else setDestination(+lat, +lon, label)
-      setQuery('')
+      setDestination(+lat, +lon, display_name.split(',')[0])
     } catch {
       setStatus('Connection lost to server')
     }
@@ -367,16 +450,11 @@ export default function App() {
 
   const getRoute = async (mode) => {
     if (!destPosRef.current) return setStatus('Tap the map or search to set a destination first')
-    const a = startPosRef.current || posRef.current
-    if (!a) {
-      setStatus('Finding your position first — tap the mode again once located (or pick a start point on the map)')
+    if (!posRef.current) {
+      setStatus('Finding your position first — tap the mode again once located')
       return locate()
     }
-    // Does this route begin where the player really is?
-    const fromCurrent =
-      !startPosRef.current ||
-      (posRef.current && distMeters(startPosRef.current, posRef.current) < SAME_SPOT_M)
-    const b = destPosRef.current
+    const a = posRef.current, b = destPosRef.current
     clearRoute()
     setStatus('Calculating path…')
     try {
@@ -400,7 +478,7 @@ export default function App() {
           }
         })
         const dur = (new Date(it.endTime) - new Date(it.startTime)) / 1000 || it.duration
-        setRoute({ mode, time: fmtTime(dur), dist: null, legs, fromCurrent })
+        setRoute({ mode, time: fmtTime(dur), dist: null, legs })
       } else {
         const profile = mode === 'drive' ? 'routed-car' : 'routed-bike'
         const url =
@@ -417,7 +495,7 @@ export default function App() {
           after: s.distance,
           isArrive: s.maneuver.type === 'arrive',
         }))
-        setRoute({ mode, dist: fmtDist(r.distance), time: fmtTime(r.duration), legs: null, fromCurrent })
+        setRoute({ mode, dist: fmtDist(r.distance), time: fmtTime(r.duration), legs: null })
       }
       mapRef.current.fitBounds(L.latLngBounds([a, b]).pad(0.25))
       setStatus('')
@@ -426,16 +504,36 @@ export default function App() {
     }
   }
 
-  const rerouteFromMe = () => {
-    const mode = route?.mode
-    resetStartToMe()
-    if (mode) getRoute(mode)
-  }
-
   // ---- UI -----------------------------------------------------------------
   return (
     <div className={`world ${night ? 'night' : ''} ${blocky ? 'is-blocky' : ''}`}>
       <div ref={mapEl} className="map" />
+
+      {/* Join screen */}
+      {!player && (
+        <div className="join-overlay">
+          <div className="join-box">
+            <h1 className="logo big">EnderMaps</h1>
+            <p className="join-sub">Multiplayer overworld</p>
+            <form onSubmit={join} className="join-form">
+              <input
+                value={nameInput}
+                onChange={(e) => setNameInput(e.target.value)}
+                placeholder="Enter your gamertag"
+                maxLength={16}
+                autoFocus
+                aria-label="Gamertag"
+              />
+              <button className="mc-btn start-btn" type="submit">Join World</button>
+            </form>
+            <p className="join-note">
+              ⚠ While visible, your gamertag and live position are broadcast to
+              everyone using EnderMaps, over a public channel. Press the 👁 button
+              in-game to go invisible at any time.
+            </p>
+          </div>
+        </div>
+      )}
 
       {nav && (
         <div className="nav-banner" role="status">
@@ -461,24 +559,6 @@ export default function App() {
           />
           <button className="mc-btn" type="submit">Go</button>
         </form>
-
-        <div className="pick-row">
-          <span className="pick-label">Tap sets:</span>
-          <button
-            className={`mc-btn seg ${pick === 'start' ? 'active' : ''}`}
-            onClick={() => changePick('start')}
-          >⚑ Start</button>
-          <button
-            className={`mc-btn seg ${pick === 'dest' ? 'active' : ''}`}
-            onClick={() => changePick('dest')}
-          >✕ Dest</button>
-        </div>
-        <div className="from-line">
-          From: {customStart ? `⚑ ${customStart}` : '◈ My location'}
-          {customStart && (
-            <button className="mc-btn tiny" onClick={resetStartToMe}>use my location</button>
-          )}
-        </div>
 
         {hasDest && (
           <div className="mode-row">
@@ -513,14 +593,7 @@ export default function App() {
               </ol>
             )}
             {route.mode !== 'transit' && !nav && (
-              route.fromCurrent ? (
-                <button className="mc-btn start-btn" onClick={startNav}>▶ START</button>
-              ) : (
-                <div className="start-note">
-                  Live navigation needs the route to begin where you are.
-                  <button className="mc-btn tiny" onClick={rerouteFromMe}>◈ Reroute from my location</button>
-                </div>
-              )
+              <button className="mc-btn start-btn" onClick={startNav}>▶ START</button>
             )}
           </div>
         )}
@@ -529,16 +602,27 @@ export default function App() {
       </div>
 
       <div className="panel hud top-right" aria-live="polite">
+        {player && <div className="hud-name">{visible ? '🟢' : '👻'} {player.name}</div>}
         <div>XYZ: {hud.x} / {hud.y} / {hud.z}</div>
         <div>Chunk: {Math.floor(hud.x / 16)} {Math.floor(hud.z / 16)}</div>
         <div>Biome: {hud.biome}</div>
         <div>Render distance: {hud.zoom}</div>
+        {player && <div>Players online: {online}</div>}
       </div>
 
       <div className="hotbar">
         <button className="mc-btn slot" onClick={() => mapRef.current.zoomIn()} aria-label="Zoom in">+</button>
         <button className="mc-btn slot" onClick={() => mapRef.current.zoomOut()} aria-label="Zoom out">−</button>
         <button className="mc-btn slot wide" onClick={() => locate()}>◈ Locate me</button>
+        {player && (
+          <button
+            className={`mc-btn slot wide ${visible ? '' : 'ghosted'}`}
+            onClick={toggleVisible}
+            title="Toggle whether other players can see you"
+          >
+            {visible ? '👁 Visible' : '👻 Invisible'}
+          </button>
+        )}
         <button className="mc-btn slot wide" onClick={toggleGraphics}>
           {blocky ? 'Graphics: Blocky' : 'Graphics: Fancy'}
         </button>
