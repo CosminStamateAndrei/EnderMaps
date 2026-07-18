@@ -1,0 +1,156 @@
+/* ---- EnderMaps design tokens ------------------------------------------- */
+:root {
+  --dirt-dark: #5c3d22;
+  --dirt: #7a5230;
+  --dirt-light: #976b3f;
+  --grass: #6aab4a;
+  --stone: #8b8b8b;
+  --stone-dark: #555;
+  --parchment: #d6c08f;
+  --hud-bg: rgba(16, 12, 24, 0.82);
+  --text-shadow: 2px 2px 0 #3f3f3f;
+  --font-pixel: 'Press Start 2P', monospace;
+  --font-body: 'VT323', monospace;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body { font-family: var(--font-body); background: #2a1e12; overflow: hidden; }
+
+.world { position: relative; height: 100%; }
+
+/* The signature: the whole real world rendered as chunky texels inside a
+   dirt-block frame, like holding a giant map item. */
+.map {
+  height: 100%;
+  border: 12px solid var(--dirt);
+  border-image: repeating-linear-gradient(
+      45deg,
+      var(--dirt) 0 8px,
+      var(--dirt-dark) 8px 12px,
+      #8a5f38 12px 18px
+    ) 12;
+  filter: saturate(1.35) contrast(1.08);
+}
+.map .leaflet-tile {
+  image-rendering: pixelated;
+}
+.night .map { filter: saturate(1.1) brightness(0.55) hue-rotate(200deg) contrast(1.15); }
+
+/* Panels */
+.panel {
+  position: absolute;
+  z-index: 1000;
+  padding: 12px;
+  background: var(--hud-bg);
+  border: 3px solid #000;
+  box-shadow: inset 0 0 0 2px #5f5f8f;
+  color: #fff;
+}
+.top-left { top: 24px; left: 24px; max-width: min(380px, calc(100vw - 48px)); }
+.top-right { top: 24px; right: 24px; }
+
+.logo {
+  margin: 0 0 10px;
+  font-family: var(--font-pixel);
+  font-size: 18px;
+  color: var(--grass);
+  text-shadow: var(--text-shadow);
+  letter-spacing: 1px;
+}
+
+/* Search styled like the in-game chat line */
+.chatbar { display: flex; align-items: center; gap: 6px; }
+.chat-caret { color: #aaa; font-family: var(--font-pixel); font-size: 12px; }
+.chatbar input {
+  flex: 1;
+  min-width: 0;
+  background: rgba(0, 0, 0, 0.6);
+  border: 2px solid #000;
+  box-shadow: inset 0 0 0 1px #444;
+  color: #fff;
+  font-family: var(--font-body);
+  font-size: 20px;
+  padding: 4px 8px;
+  outline: none;
+}
+.chatbar input:focus-visible { box-shadow: inset 0 0 0 2px var(--grass); }
+.status { margin-top: 8px; font-size: 18px; color: #ffd75e; }
+
+/* Classic bevelled stone button */
+.mc-btn {
+  font-family: var(--font-pixel);
+  font-size: 11px;
+  color: #fff;
+  text-shadow: var(--text-shadow);
+  background: var(--stone);
+  border: 2px solid #000;
+  box-shadow:
+    inset 2px 2px 0 rgba(255, 255, 255, 0.45),
+    inset -2px -2px 0 rgba(0, 0, 0, 0.45);
+  padding: 8px 10px;
+  cursor: pointer;
+}
+.mc-btn:hover { background: #7b8bc5; }
+.mc-btn:active {
+  box-shadow:
+    inset -2px -2px 0 rgba(255, 255, 255, 0.35),
+    inset 2px 2px 0 rgba(0, 0, 0, 0.5);
+}
+.mc-btn:focus-visible { outline: 3px solid #ffd75e; outline-offset: 1px; }
+
+/* F3 debug HUD */
+.hud {
+  font-family: var(--font-pixel);
+  font-size: 10px;
+  line-height: 2.1;
+  text-shadow: var(--text-shadow);
+}
+
+/* Bottom hotbar */
+.hotbar {
+  position: absolute;
+  z-index: 1000;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  background: rgba(0, 0, 0, 0.55);
+  border: 3px solid #000;
+  box-shadow: inset 0 0 0 2px #666;
+}
+.slot { min-width: 46px; min-height: 46px; }
+.slot.wide { padding: 8px 14px; }
+
+.player-arrow { filter: drop-shadow(2px 2px 0 rgba(0, 0, 0, 0.5)); }
+
+/* Leaflet chrome, re-skinned */
+.leaflet-container { background: #7db4e6; font-family: var(--font-body); }
+.leaflet-popup-content-wrapper {
+  background: var(--parchment);
+  border: 3px solid var(--dirt-dark);
+  border-radius: 0;
+  color: #3b2a14;
+  font-family: var(--font-body);
+  font-size: 19px;
+}
+.leaflet-popup-tip { background: var(--parchment); border: 1px solid var(--dirt-dark); }
+.leaflet-control-attribution {
+  background: rgba(0, 0, 0, 0.6) !important;
+  color: #bbb;
+  font-family: var(--font-body);
+  font-size: 13px;
+}
+.leaflet-control-attribution a { color: var(--grass); }
+
+@media (max-width: 640px) {
+  .top-right { top: auto; bottom: 100px; right: 12px; }
+  .top-left { top: 12px; left: 12px; right: 12px; }
+  .hud { font-size: 8px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .leaflet-zoom-animated { transition: none !important; }
+}
