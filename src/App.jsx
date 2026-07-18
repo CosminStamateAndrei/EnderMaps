@@ -81,24 +81,38 @@ const maneuverText = (step) => {
   return { icon: ARROWS[modifier] || '⬆', text: `Turn ${modifier || ''}${name}`.replace('  ', ' ') }
 }
 
-// ---- Pixel icons (inline SVG, no game assets) -----------------------------
+// ---- Pixel icons (original pixel art, drawn in the style of in-game map
+// markers — a stepped white cursor for the player, a red X for the target) ---
 const playerIcon = L.divIcon({
   className: 'pixel-marker',
-  html: `<svg width="28" height="28" viewBox="0 0 14 14" style="image-rendering:pixelated">
-    <path d="M7 0 L13 13 L7 10 L1 13 Z" fill="#ffffff" stroke="#3a3a3a" stroke-width="1"/>
+  html: `<svg width="30" height="26" viewBox="-1 -1 18 15" shape-rendering="crispEdges" style="image-rendering:pixelated">
+    <path d="M7 0 H9 V2 H11 V4 H13 V6 H15 V12 H10 V9 H6 V12 H1 V6 H3 V4 H5 V2 H7 Z"
+      fill="#ffffff" stroke="#3a3a3a" stroke-width="1"/>
+    <path d="M7 2 H8 V4 H9 V6 H8 V9 H7 V6 H6 V4 H7 Z" fill="#c8c8c8"/>
   </svg>`,
-  iconSize: [28, 28],
-  iconAnchor: [14, 14],
+  iconSize: [30, 26],
+  iconAnchor: [15, 13],
 })
 const destIcon = L.divIcon({
   className: 'pixel-marker',
-  html: `<svg width="26" height="26" viewBox="0 0 13 13" style="image-rendering:pixelated">
-    <rect x="5" y="1" width="3" height="8" fill="#a35ce8"/>
-    <rect x="4" y="0" width="5" height="3" fill="#c98cff"/>
-    <rect x="5" y="9" width="3" height="3" fill="#5a3d1e"/>
+  html: `<svg width="28" height="28" viewBox="0 0 18 18" shape-rendering="crispEdges" style="image-rendering:pixelated">
+    <g fill="#6e1616">
+      <rect x="1" y="1" width="4" height="4"/><rect x="4" y="4" width="4" height="4"/>
+      <rect x="7" y="7" width="4" height="4"/><rect x="10" y="10" width="4" height="4"/>
+      <rect x="13" y="13" width="4" height="4"/>
+      <rect x="1" y="13" width="4" height="4"/><rect x="4" y="10" width="4" height="4"/>
+      <rect x="10" y="4" width="4" height="4"/><rect x="13" y="1" width="4" height="4"/>
+    </g>
+    <g fill="#d63a3a">
+      <rect x="0" y="0" width="4" height="4"/><rect x="3" y="3" width="4" height="4"/>
+      <rect x="6" y="6" width="4" height="4"/><rect x="9" y="9" width="4" height="4"/>
+      <rect x="12" y="12" width="4" height="4"/>
+      <rect x="0" y="12" width="4" height="4"/><rect x="3" y="9" width="4" height="4"/>
+      <rect x="9" y="3" width="4" height="4"/><rect x="12" y="0" width="4" height="4"/>
+    </g>
   </svg>`,
-  iconSize: [26, 26],
-  iconAnchor: [13, 24],
+  iconSize: [28, 28],
+  iconAnchor: [14, 14],
 })
 
 const MODES = {
