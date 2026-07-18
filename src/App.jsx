@@ -506,7 +506,7 @@ export default function App() {
 
   // ---- UI -----------------------------------------------------------------
   return (
-    <div className={`world ${night ? 'night' : ''} ${blocky ? 'is-blocky' : ''}`}>
+    <div className={`world ${night ? 'night' : ''} ${blocky ? 'is-blocky' : ''} ${nav ? 'navving' : ''}`}>
       <div ref={mapEl} className="map" />
 
       {/* Join screen */}
