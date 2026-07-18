@@ -20,8 +20,18 @@ const biomeFor = (lat, zoom) => {
   return 'Jungle'
 }
 
-// Decode a Google-encoded polyline. Tries precision 5, falls back to 7
-// (different routing servers use different precisions).
+// Meters between two lat/lng points (haversine)
+const distMeters = (a, b) => {
+  const toRad = (d) => (d * Math.PI) / 180
+  const dLat = toRad(b.lat - a.lat)
+  const dLng = toRad(b.lng - a.lng)
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2
+  return 2 * R * Math.asin(Math.sqrt(h))
+}
+
+// Decode a Google-encoded polyline. Tries precision 5, falls back to 7.
 function decodePolyline(str, precision = 5) {
   let index = 0, lat = 0, lng = 0
   const coords = []
@@ -54,6 +64,23 @@ const fmtTime = (s) => {
   return min >= 60 ? `${Math.floor(min / 60)} h ${min % 60} min` : `${min} min`
 }
 
+// Turn an OSRM maneuver into banner text + a pixel-arrow glyph
+const ARROWS = {
+  left: '⬅', right: '➡', 'slight left': '↖', 'slight right': '↗',
+  'sharp left': '↙', 'sharp right': '↘', straight: '⬆', uturn: '↶',
+}
+const maneuverText = (step) => {
+  const { type, modifier } = step.maneuver
+  const name = step.name ? ` onto ${step.name}` : ''
+  if (type === 'arrive') return { icon: '⚑', text: 'You have arrived' }
+  if (type === 'depart') return { icon: '⬆', text: `Head ${modifier || 'out'}${name}` }
+  if (type === 'roundabout' || type === 'rotary')
+    return { icon: '↻', text: `Take the roundabout${name}` }
+  if (type === 'new name' || type === 'continue')
+    return { icon: ARROWS[modifier] || '⬆', text: modifier && modifier !== 'straight' ? `Keep ${modifier}${name}` : `Continue straight${name}` }
+  return { icon: ARROWS[modifier] || '⬆', text: `Turn ${modifier || ''}${name}`.replace('  ', ' ') }
+}
+
 // ---- Pixel icons (inline SVG, no game assets) -----------------------------
 const playerIcon = L.divIcon({
   className: 'pixel-marker',
@@ -75,7 +102,7 @@ const destIcon = L.divIcon({
 })
 
 const MODES = {
-  drive: { label: '🛒 Drive', color: '#ffd75e' },
+  drive: { label: '🛒 Drive', color: '#3b82f6' },
   cycle: { label: '🚲 Cycle', color: '#6aab4a' },
   transit: { label: '🚌 Transit', color: '#a35ce8' },
 }
@@ -88,9 +115,12 @@ export default function App() {
   const accuracyRef = useRef(null)
   const destRef = useRef(null)
   const routeRef = useRef(L.layerGroup())
-  const posRef = useRef(null) // { lat, lng }
+  const posRef = useRef(null)
   const destPosRef = useRef(null)
   const watchRef = useRef(null)
+  const stepsRef = useRef([])   // OSRM steps for the active drive/cycle route
+  const stepIdxRef = useRef(0)  // next maneuver we're heading towards
+  const navRef = useRef(false)  // live-navigation mode on/off
 
   const [hud, setHud] = useState({ x: 0, y: 64, z: 0, biome: 'Plains', zoom: 13 })
   const [query, setQuery] = useState('')
@@ -98,7 +128,8 @@ export default function App() {
   const [night, setNight] = useState(false)
   const [blocky, setBlocky] = useState(false)
   const [hasDest, setHasDest] = useState(false)
-  const [route, setRoute] = useState(null) // { mode, dist, time, legs? }
+  const [route, setRoute] = useState(null)
+  const [nav, setNav] = useState(null) // { icon, text, dist, remaining }
 
   // ---- Map setup ----------------------------------------------------------
   useEffect(() => {
@@ -132,7 +163,10 @@ export default function App() {
     map.on('move zoom', updateHud)
     updateHud()
 
-    map.on('click', (e) => setDestination(e.latlng.lat, e.latlng.lng, 'Waypoint'))
+    map.on('click', (e) => {
+      if (navRef.current) return // don't retarget mid-navigation by accident
+      setDestination(e.latlng.lat, e.latlng.lng, 'Waypoint')
+    })
     return () => watchRef.current && navigator.geolocation.clearWatch(watchRef.current)
   }, [])
 
@@ -145,15 +179,38 @@ export default function App() {
     setBlocky(next)
   }
 
+  // ---- Turn-by-turn: called on every GPS fix while navigating -------------
+  const updateNav = (pos) => {
+    const steps = stepsRef.current
+    if (!steps.length) return
+    let i = stepIdxRef.current
+    let d = distMeters(pos, steps[i].loc)
+    // Passed the maneuver? Advance (loop in case GPS jumped past several)
+    while (i < steps.length - 1 && d < 25) {
+      i += 1
+      d = distMeters(pos, steps[i].loc)
+    }
+    stepIdxRef.current = i
+    const remaining = d + steps.slice(i).reduce((s, st) => s + st.after, 0)
+    const { icon, text } = steps[i].banner
+    if (steps[i].isArrive && d < 30) {
+      setNav({ icon, text, dist: '', remaining: '' })
+      stopNav(false)
+      setStatus('⚑ Destination reached!')
+    } else {
+      setNav({ icon, text, dist: `In ${fmtDist(d)}`, remaining: fmtDist(remaining) })
+    }
+  }
+
   // ---- Player location (high accuracy, live) ------------------------------
-  const locate = () => {
+  const locate = (follow = false) => {
     if (!navigator.geolocation) return setStatus('This browser has no location support')
     setStatus('Locating player…')
     if (watchRef.current) navigator.geolocation.clearWatch(watchRef.current)
     let first = true
     watchRef.current = navigator.geolocation.watchPosition(
       (pos) => {
-        const { latitude: lat, longitude: lng, accuracy } = pos.coords
+        const { latitude: lat, longitude: lng, accuracy, heading } = pos.coords
         posRef.current = { lat, lng }
         if (!playerRef.current) {
           playerRef.current = L.marker([lat, lng], { icon: playerIcon }).addTo(mapRef.current)
@@ -164,19 +221,42 @@ export default function App() {
           playerRef.current.setLatLng([lat, lng])
           accuracyRef.current.setLatLng([lat, lng]).setRadius(accuracy)
         }
-        if (first) {
+        // Rotate the arrow to your direction of travel when the device reports it
+        const svg = playerRef.current.getElement()?.querySelector('svg')
+        if (svg && heading != null && !Number.isNaN(heading))
+          svg.style.transform = `rotate(${heading}deg)`
+
+        if (navRef.current) {
+          mapRef.current.setView([lat, lng], Math.max(mapRef.current.getZoom(), 17), { animate: true })
+          updateNav({ lat, lng })
+        } else if (first) {
           mapRef.current.flyTo([lat, lng], 16, { duration: 1.2 })
-          first = false
+          setStatus(
+            accuracy > 300
+              ? `Position ±${Math.round(accuracy)} m — desktop browsers guess from your network; a phone with GPS is far more accurate`
+              : `Position ±${Math.round(accuracy)} m`
+          )
         }
-        setStatus(
-          accuracy > 300
-            ? `Position ±${Math.round(accuracy)} m — desktop browsers guess from your network; a phone with GPS is far more accurate`
-            : `Position ±${Math.round(accuracy)} m`
-        )
+        first = false
       },
       (err) => setStatus(err.code === 1 ? 'Location blocked — allow it in your browser' : 'Player not found'),
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     )
+  }
+
+  // ---- Navigation on/off --------------------------------------------------
+  const startNav = () => {
+    if (!stepsRef.current.length) return
+    navRef.current = true
+    stepIdxRef.current = 0
+    setStatus('')
+    locate(true)
+    if (posRef.current) updateNav(posRef.current)
+    else setNav({ icon: '⬆', text: 'Waiting for GPS…', dist: '', remaining: '' })
+  }
+  const stopNav = (clearBanner = true) => {
+    navRef.current = false
+    if (clearBanner) setNav(null)
   }
 
   // ---- Destination + search ----------------------------------------------
@@ -211,6 +291,8 @@ export default function App() {
   // ---- Routing ------------------------------------------------------------
   const clearRoute = () => {
     routeRef.current.clearLayers()
+    stepsRef.current = []
+    stopNav()
     setRoute(null)
   }
 
@@ -254,12 +336,20 @@ export default function App() {
         const profile = mode === 'drive' ? 'routed-car' : 'routed-bike'
         const url =
           `https://routing.openstreetmap.de/${profile}/route/v1/x/` +
-          `${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson`
+          `${a.lng},${a.lat};${b.lng},${b.lat}?overview=full&geometries=geojson&steps=true`
         const res = await fetch(url)
         const data = await res.json()
         const r = data?.routes?.[0]
         if (!r) return setStatus('No route found')
         drawLine(r.geometry.coordinates.map(([lng, lat]) => [lat, lng]), MODES[mode].color)
+        // Store maneuvers for turn-by-turn: where it happens, what to say,
+        // and how many meters follow it until the next one.
+        stepsRef.current = (r.legs?.[0]?.steps || []).map((s) => ({
+          loc: { lat: s.maneuver.location[1], lng: s.maneuver.location[0] },
+          banner: maneuverText(s),
+          after: s.distance,
+          isArrive: s.maneuver.type === 'arrive',
+        }))
         setRoute({ mode, dist: fmtDist(r.distance), time: fmtTime(r.duration), legs: null })
       }
       mapRef.current.fitBounds(L.latLngBounds([a, b]).pad(0.25))
@@ -273,6 +363,19 @@ export default function App() {
   return (
     <div className={`world ${night ? 'night' : ''} ${blocky ? 'is-blocky' : ''}`}>
       <div ref={mapEl} className="map" />
+
+      {/* Turn-by-turn banner, top-center while navigating */}
+      {nav && (
+        <div className="nav-banner" role="status">
+          <span className="nav-icon">{nav.icon}</span>
+          <div className="nav-text">
+            {nav.dist && <div className="nav-dist">{nav.dist}</div>}
+            <div className="nav-instruction">{nav.text}</div>
+            {nav.remaining && <div className="nav-remaining">{nav.remaining} to go</div>}
+          </div>
+          <button className="mc-btn tiny" onClick={() => stopNav()} aria-label="Stop navigation">✕</button>
+        </div>
+      )}
 
       <div className="panel top-left">
         <h1 className="logo">EnderMaps</h1>
@@ -319,6 +422,9 @@ export default function App() {
                 ))}
               </ol>
             )}
+            {route.mode !== 'transit' && !nav && (
+              <button className="mc-btn start-btn" onClick={startNav}>▶ START</button>
+            )}
           </div>
         )}
 
@@ -335,7 +441,7 @@ export default function App() {
       <div className="hotbar">
         <button className="mc-btn slot" onClick={() => mapRef.current.zoomIn()} aria-label="Zoom in">+</button>
         <button className="mc-btn slot" onClick={() => mapRef.current.zoomOut()} aria-label="Zoom out">−</button>
-        <button className="mc-btn slot wide" onClick={locate}>◈ Locate me</button>
+        <button className="mc-btn slot wide" onClick={() => locate()}>◈ Locate me</button>
         <button className="mc-btn slot wide" onClick={toggleGraphics}>
           {blocky ? 'Graphics: Blocky' : 'Graphics: Fancy'}
         </button>
