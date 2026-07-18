@@ -236,3 +236,28 @@ body { font-family: var(--font-body); background: #2a1e12; overflow: hidden; }
   /* keep the banner clear of the search panel on phones */
   .nav-banner { top: auto; bottom: 160px; }
 }
+
+/* ---- Start-point picker -------------------------------------------------- */
+.pick-row {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 10px;
+}
+.pick-label {
+  font-family: var(--font-pixel); font-size: 9px; color: #aaa;
+  text-shadow: var(--text-shadow);
+}
+.mc-btn.seg { flex: 1; font-size: 9px; padding: 6px 8px; }
+.mc-btn.seg.active { background: #4a5a8a; box-shadow:
+  inset -2px -2px 0 rgba(255, 255, 255, 0.35),
+  inset 2px 2px 0 rgba(0, 0, 0, 0.5); }
+
+.from-line {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 8px; font-size: 18px; color: #ddd;
+}
+
+.start-note {
+  margin-top: 10px;
+  display: flex; flex-direction: column; gap: 8px;
+  font-size: 17px; line-height: 1.3; color: #ffd75e;
+}

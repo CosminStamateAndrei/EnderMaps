@@ -20,7 +20,6 @@ const biomeFor = (lat, zoom) => {
   return 'Jungle'
 }
 
-// Meters between two lat/lng points (haversine)
 const distMeters = (a, b) => {
   const toRad = (d) => (d * Math.PI) / 180
   const dLat = toRad(b.lat - a.lat)
@@ -31,7 +30,6 @@ const distMeters = (a, b) => {
   return 2 * R * Math.asin(Math.sqrt(h))
 }
 
-// Decode a Google-encoded polyline. Tries precision 5, falls back to 7.
 function decodePolyline(str, precision = 5) {
   let index = 0, lat = 0, lng = 0
   const coords = []
@@ -64,7 +62,6 @@ const fmtTime = (s) => {
   return min >= 60 ? `${Math.floor(min / 60)} h ${min % 60} min` : `${min} min`
 }
 
-// Turn an OSRM maneuver into banner text + a pixel-arrow glyph
 const ARROWS = {
   left: '⬅', right: '➡', 'slight left': '↖', 'slight right': '↗',
   'sharp left': '↙', 'sharp right': '↘', straight: '⬆', uturn: '↶',
@@ -82,7 +79,7 @@ const maneuverText = (step) => {
 }
 
 // ---- Pixel icons (original pixel art, drawn in the style of in-game map
-// markers — a stepped white cursor for the player, a red X for the target) ---
+// markers — stepped white cursor, red X target, green flag for the start) ----
 const playerIcon = L.divIcon({
   className: 'pixel-marker',
   html: `<svg width="30" height="26" viewBox="-1 -1 18 15" shape-rendering="crispEdges" style="image-rendering:pixelated">
@@ -114,12 +111,27 @@ const destIcon = L.divIcon({
   iconSize: [28, 28],
   iconAnchor: [14, 14],
 })
+const startIcon = L.divIcon({
+  className: 'pixel-marker',
+  html: `<svg width="28" height="28" viewBox="0 0 16 16" shape-rendering="crispEdges" style="image-rendering:pixelated">
+    <rect x="6" y="1" width="1" height="14" fill="#2a2a2a"/>
+    <rect x="7" y="1" width="2" height="14" fill="#5a3d1e"/>
+    <rect x="9" y="1" width="6" height="2" fill="#2f8f3a"/>
+    <rect x="9" y="3" width="5" height="2" fill="#43b34d"/>
+    <rect x="9" y="5" width="3" height="2" fill="#2f8f3a"/>
+  </svg>`,
+  iconSize: [28, 28],
+  iconAnchor: [13, 26],
+})
 
 const MODES = {
   drive: { label: '🛒 Drive', color: '#3b82f6' },
   cycle: { label: '🚲 Cycle', color: '#6aab4a' },
   transit: { label: '🚌 Transit', color: '#a35ce8' },
 }
+
+// Routes starting within this distance of your GPS fix count as "from here"
+const SAME_SPOT_M = 50
 
 export default function App() {
   const mapEl = useRef(null)
@@ -128,13 +140,16 @@ export default function App() {
   const playerRef = useRef(null)
   const accuracyRef = useRef(null)
   const destRef = useRef(null)
+  const startMarkerRef = useRef(null)
   const routeRef = useRef(L.layerGroup())
-  const posRef = useRef(null)
+  const posRef = useRef(null)       // live GPS position
+  const startPosRef = useRef(null)  // custom start; null = use live position
   const destPosRef = useRef(null)
   const watchRef = useRef(null)
-  const stepsRef = useRef([])   // OSRM steps for the active drive/cycle route
-  const stepIdxRef = useRef(0)  // next maneuver we're heading towards
-  const navRef = useRef(false)  // live-navigation mode on/off
+  const stepsRef = useRef([])
+  const stepIdxRef = useRef(0)
+  const navRef = useRef(false)
+  const pickRef = useRef('dest')    // what a map tap sets: 'start' | 'dest'
 
   const [hud, setHud] = useState({ x: 0, y: 64, z: 0, biome: 'Plains', zoom: 13 })
   const [query, setQuery] = useState('')
@@ -142,8 +157,10 @@ export default function App() {
   const [night, setNight] = useState(false)
   const [blocky, setBlocky] = useState(false)
   const [hasDest, setHasDest] = useState(false)
-  const [route, setRoute] = useState(null)
-  const [nav, setNav] = useState(null) // { icon, text, dist, remaining }
+  const [pick, setPick] = useState('dest')
+  const [customStart, setCustomStart] = useState(null) // label, or null = my location
+  const [route, setRoute] = useState(null)             // { mode, dist, time, legs, fromCurrent }
+  const [nav, setNav] = useState(null)
 
   // ---- Map setup ----------------------------------------------------------
   useEffect(() => {
@@ -178,11 +195,18 @@ export default function App() {
     updateHud()
 
     map.on('click', (e) => {
-      if (navRef.current) return // don't retarget mid-navigation by accident
-      setDestination(e.latlng.lat, e.latlng.lng, 'Waypoint')
+      if (navRef.current) return
+      if (pickRef.current === 'start') setStart(e.latlng.lat, e.latlng.lng, 'Picked point')
+      else setDestination(e.latlng.lat, e.latlng.lng, 'Waypoint')
     })
     return () => watchRef.current && navigator.geolocation.clearWatch(watchRef.current)
   }, [])
+
+  const changePick = (target) => {
+    pickRef.current = target
+    setPick(target)
+    setStatus(target === 'start' ? 'Tap the map (or search) to set the START point' : 'Tap the map (or search) to set the destination')
+  }
 
   // ---- Graphics toggle ----------------------------------------------------
   const toggleGraphics = () => {
@@ -193,13 +217,12 @@ export default function App() {
     setBlocky(next)
   }
 
-  // ---- Turn-by-turn: called on every GPS fix while navigating -------------
+  // ---- Turn-by-turn -------------------------------------------------------
   const updateNav = (pos) => {
     const steps = stepsRef.current
     if (!steps.length) return
     let i = stepIdxRef.current
     let d = distMeters(pos, steps[i].loc)
-    // Passed the maneuver? Advance (loop in case GPS jumped past several)
     while (i < steps.length - 1 && d < 25) {
       i += 1
       d = distMeters(pos, steps[i].loc)
@@ -216,8 +239,8 @@ export default function App() {
     }
   }
 
-  // ---- Player location (high accuracy, live) ------------------------------
-  const locate = (follow = false) => {
+  // ---- Player location ----------------------------------------------------
+  const locate = () => {
     if (!navigator.geolocation) return setStatus('This browser has no location support')
     setStatus('Locating player…')
     if (watchRef.current) navigator.geolocation.clearWatch(watchRef.current)
@@ -235,7 +258,6 @@ export default function App() {
           playerRef.current.setLatLng([lat, lng])
           accuracyRef.current.setLatLng([lat, lng]).setRadius(accuracy)
         }
-        // Rotate the arrow to your direction of travel when the device reports it
         const svg = playerRef.current.getElement()?.querySelector('svg')
         if (svg && heading != null && !Number.isNaN(heading))
           svg.style.transform = `rotate(${heading}deg)`
@@ -261,10 +283,12 @@ export default function App() {
   // ---- Navigation on/off --------------------------------------------------
   const startNav = () => {
     if (!stepsRef.current.length) return
+    if (!route?.fromCurrent)
+      return setStatus('Live navigation only works from where you actually are — reroute from your location first')
     navRef.current = true
     stepIdxRef.current = 0
     setStatus('')
-    locate(true)
+    locate()
     if (posRef.current) updateNav(posRef.current)
     else setNav({ icon: '⬆', text: 'Waiting for GPS…', dist: '', remaining: '' })
   }
@@ -273,7 +297,30 @@ export default function App() {
     if (clearBanner) setNav(null)
   }
 
-  // ---- Destination + search ----------------------------------------------
+  // ---- Start & destination ------------------------------------------------
+  const setStart = (lat, lng, label) => {
+    startPosRef.current = { lat, lng }
+    setCustomStart(label)
+    if (startMarkerRef.current) startMarkerRef.current.remove()
+    startMarkerRef.current = L.marker([lat, lng], { icon: startIcon })
+      .addTo(mapRef.current)
+      .bindPopup(`Start: ${label}`)
+    clearRoute()
+    changePick('dest')
+    setStatus('Start set — now set a destination and pick a travel mode')
+  }
+
+  const resetStartToMe = () => {
+    startPosRef.current = null
+    setCustomStart(null)
+    if (startMarkerRef.current) {
+      startMarkerRef.current.remove()
+      startMarkerRef.current = null
+    }
+    clearRoute()
+    setStatus('Start: your live position')
+  }
+
   const setDestination = (lat, lng, label) => {
     destPosRef.current = { lat, lng }
     setHasDest(true)
@@ -295,8 +342,11 @@ export default function App() {
       const data = await res.json()
       if (!data.length) return setStatus('Structure not found')
       const { lat, lon, display_name } = data[0]
+      const label = display_name.split(',')[0]
       mapRef.current.flyTo([+lat, +lon], 15, { duration: 1.2 })
-      setDestination(+lat, +lon, display_name.split(',')[0])
+      if (pickRef.current === 'start') setStart(+lat, +lon, label)
+      else setDestination(+lat, +lon, label)
+      setQuery('')
     } catch {
       setStatus('Connection lost to server')
     }
@@ -317,11 +367,16 @@ export default function App() {
 
   const getRoute = async (mode) => {
     if (!destPosRef.current) return setStatus('Tap the map or search to set a destination first')
-    if (!posRef.current) {
-      setStatus('Finding your position first — tap the mode again once located')
+    const a = startPosRef.current || posRef.current
+    if (!a) {
+      setStatus('Finding your position first — tap the mode again once located (or pick a start point on the map)')
       return locate()
     }
-    const a = posRef.current, b = destPosRef.current
+    // Does this route begin where the player really is?
+    const fromCurrent =
+      !startPosRef.current ||
+      (posRef.current && distMeters(startPosRef.current, posRef.current) < SAME_SPOT_M)
+    const b = destPosRef.current
     clearRoute()
     setStatus('Calculating path…')
     try {
@@ -345,7 +400,7 @@ export default function App() {
           }
         })
         const dur = (new Date(it.endTime) - new Date(it.startTime)) / 1000 || it.duration
-        setRoute({ mode, time: fmtTime(dur), dist: null, legs })
+        setRoute({ mode, time: fmtTime(dur), dist: null, legs, fromCurrent })
       } else {
         const profile = mode === 'drive' ? 'routed-car' : 'routed-bike'
         const url =
@@ -356,15 +411,13 @@ export default function App() {
         const r = data?.routes?.[0]
         if (!r) return setStatus('No route found')
         drawLine(r.geometry.coordinates.map(([lng, lat]) => [lat, lng]), MODES[mode].color)
-        // Store maneuvers for turn-by-turn: where it happens, what to say,
-        // and how many meters follow it until the next one.
         stepsRef.current = (r.legs?.[0]?.steps || []).map((s) => ({
           loc: { lat: s.maneuver.location[1], lng: s.maneuver.location[0] },
           banner: maneuverText(s),
           after: s.distance,
           isArrive: s.maneuver.type === 'arrive',
         }))
-        setRoute({ mode, dist: fmtDist(r.distance), time: fmtTime(r.duration), legs: null })
+        setRoute({ mode, dist: fmtDist(r.distance), time: fmtTime(r.duration), legs: null, fromCurrent })
       }
       mapRef.current.fitBounds(L.latLngBounds([a, b]).pad(0.25))
       setStatus('')
@@ -373,12 +426,17 @@ export default function App() {
     }
   }
 
+  const rerouteFromMe = () => {
+    const mode = route?.mode
+    resetStartToMe()
+    if (mode) getRoute(mode)
+  }
+
   // ---- UI -----------------------------------------------------------------
   return (
     <div className={`world ${night ? 'night' : ''} ${blocky ? 'is-blocky' : ''}`}>
       <div ref={mapEl} className="map" />
 
-      {/* Turn-by-turn banner, top-center while navigating */}
       {nav && (
         <div className="nav-banner" role="status">
           <span className="nav-icon">{nav.icon}</span>
@@ -403,6 +461,24 @@ export default function App() {
           />
           <button className="mc-btn" type="submit">Go</button>
         </form>
+
+        <div className="pick-row">
+          <span className="pick-label">Tap sets:</span>
+          <button
+            className={`mc-btn seg ${pick === 'start' ? 'active' : ''}`}
+            onClick={() => changePick('start')}
+          >⚑ Start</button>
+          <button
+            className={`mc-btn seg ${pick === 'dest' ? 'active' : ''}`}
+            onClick={() => changePick('dest')}
+          >✕ Dest</button>
+        </div>
+        <div className="from-line">
+          From: {customStart ? `⚑ ${customStart}` : '◈ My location'}
+          {customStart && (
+            <button className="mc-btn tiny" onClick={resetStartToMe}>use my location</button>
+          )}
+        </div>
 
         {hasDest && (
           <div className="mode-row">
@@ -437,7 +513,14 @@ export default function App() {
               </ol>
             )}
             {route.mode !== 'transit' && !nav && (
-              <button className="mc-btn start-btn" onClick={startNav}>▶ START</button>
+              route.fromCurrent ? (
+                <button className="mc-btn start-btn" onClick={startNav}>▶ START</button>
+              ) : (
+                <div className="start-note">
+                  Live navigation needs the route to begin where you are.
+                  <button className="mc-btn tiny" onClick={rerouteFromMe}>◈ Reroute from my location</button>
+                </div>
+              )
             )}
           </div>
         )}
